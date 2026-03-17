@@ -93,20 +93,72 @@ claude mcp add jetson-xavier --transport streamable-http http://<jetson-ip>:8765
 }
 ```
 
-## 제공 도구 목록
+## 제공 도구 목록 (17개)
 
+### 시스템 & 연결
 | 도구 | 설명 |
 |------|------|
 | `ping` | 서버 연결 상태 확인 |
 | `system_info` | OS, CPU, 메모리, 디스크 정보 |
 | `gpu_status` | CUDA/GPU 상태 및 사용률 |
 | `python_env` | Python 버전 및 ML 패키지 목록 |
-| `execute_command` | 셸 커맨드 실행 |
+| `list_processes` | 프로세스 목록 확인 |
+
+### 실행
+| 도구 | 설명 |
+|------|------|
+| `execute_command` | 셸 커맨드 실행 (위험 명령어 차단) |
 | `run_python` | Python 코드 실행 (CUDA 가속) |
 | `read_file` | 파일 읽기 |
 | `write_file` | 파일 쓰기 |
 | `cuda_benchmark` | CUDA 행렬 연산 벤치마크 |
-| `list_processes` | 프로세스 목록 확인 |
+
+### 패키지 관리
+| 도구 | 설명 |
+|------|------|
+| `install_package` | JetPack 호환성 체크 후 안전 설치 |
+| `list_compatible_packages` | 호환 패키지 버전 목록 |
+
+### Task Queue (비동기 작업)
+| 도구 | 설명 |
+|------|------|
+| `submit_job` | 장시간 작업 제출 (백그라운드 실행, 팬 자동 제어) |
+| `check_job` | 작업 상태 확인 / 전체 목록 조회 |
+| `get_result` | 완료된 작업 결과 가져오기 |
+| `get_log` | 실행 중 로그 실시간 확인 |
+
+### 팬 냉각 제어
+| 도구 | 설명 |
+|------|------|
+| `set_fan_profile` | 팬 프로파일 조회/변경 (quiet/cool/aggressive) |
+
+---
+
+## 팬 냉각 제어
+
+### 3단계 프로파일
+
+| 프로파일 | 설명 | 적합한 상황 |
+|----------|------|-------------|
+| `quiet` | 소음 최소. 50°C부터 팬 시작, 유휴 시 팬 정지 | 유휴/저부하 |
+| `cool` | 균형 모드. 35°C부터 팬 시작 | 일반 운영 |
+| `aggressive` | 냉각 우선. 팬 항상 동작, 50°C에서 최대 속도 | AI 학습/추론 |
+
+### 수동 제어
+`set_fan_profile` 도구를 사용합니다:
+- 인자 없이 호출 → 현재 프로파일 조회
+- `profile="aggressive"` → 해당 프로파일로 변경
+
+### 자동 제어 (Task Queue 연동)
+`submit_job`으로 작업 제출 시:
+1. **작업 시작**: 팬이 `aggressive` 모드로 자동 전환 (기본값)
+2. **작업 완료**: 이전 프로파일로 자동 복귀
+3. `fan_profile` 파라미터로 작업별 프로파일 지정 가능
+4. `fan_profile=""`으로 팬 변경 없이 작업 실행 가능
+
+> ⚠️ **소음 주의**: `aggressive` 모드에서는 팬 소음이 크게 증가합니다.
+
+---
 
 ## 사용 예시 (Claude Code에서)
 
@@ -116,3 +168,6 @@ Claude Code 터미널에서 이렇게 요청하면 됩니다:
 - "Jetson에서 PyTorch로 이미지 추론 실행해줘"
 - "Jetson CUDA 벤치마크 돌려줘"
 - "Jetson에 있는 파일 읽어줘"
+- "Jetson 팬 상태 확인해줘"
+- "Jetson 팬 aggressive로 바꿔줘"
+- "ResNet 학습 작업 제출해줘" (자동으로 팬 aggressive 전환)

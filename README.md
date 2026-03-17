@@ -106,20 +106,65 @@ Just ask naturally:
 - *"Jetson에서 CUDA 벤치마크 돌려줘"*
 - *"Jetson에서 PyTorch로 행렬 연산 실행해줘"*
 
-## Available Tools (10)
+## Available Tools (17)
 
+### System & Connectivity
 | Tool | Description |
 |------|-------------|
 | `ping` | Health check |
 | `system_info` | OS, CPU, memory, disk info |
 | `gpu_status` | CUDA/GPU status, tegrastats, JetPack version |
 | `python_env` | Python version and installed ML packages |
+| `list_processes` | List running processes |
+
+### Execution
+| Tool | Description |
+|------|-------------|
 | `execute_command` | Run shell commands (with safety filters) |
 | `run_python` | Execute Python code with CUDA acceleration |
 | `read_file` | Read files on Jetson |
 | `write_file` | Write files on Jetson |
 | `cuda_benchmark` | Matrix multiplication benchmark on GPU |
-| `list_processes` | List running processes |
+
+### Package Management
+| Tool | Description |
+|------|-------------|
+| `install_package` | Install Python packages with JetPack compatibility check |
+| `list_compatible_packages` | List JetPack R35.6.1 compatible package versions |
+
+### Task Queue (Async Jobs)
+| Tool | Description |
+|------|-------------|
+| `submit_job` | Submit long-running jobs (background execution with auto fan control) |
+| `check_job` | Check job status or list all jobs |
+| `get_result` | Get completed job results |
+| `get_log` | Get real-time job logs (useful for monitoring running jobs) |
+
+### Fan Cooling Control
+| Tool | Description |
+|------|-------------|
+| `set_fan_profile` | View or change fan cooling profile (quiet/cool/aggressive) |
+
+## Fan Cooling Control
+
+Jetson Xavier의 팬 냉각을 3단계로 제어합니다.
+
+| Profile | Description | Use Case |
+|---------|-------------|----------|
+| `quiet` | 소음 최소. 50°C부터 팬 시작, 유휴 시 정지 | 유휴/저부하 |
+| `cool` | 균형 모드. 35°C부터 팬 시작 | 일반 운영 |
+| `aggressive` | 팬 항상 동작. 50°C에서 최대 속도 | AI 학습/추론 |
+
+### Manual Control
+`set_fan_profile` 도구로 직접 변경하거나 현재 상태를 조회할 수 있습니다.
+
+### Automatic Control
+`submit_job`으로 작업을 제출하면:
+1. 작업 시작 시 팬이 `aggressive` 모드로 자동 전환 (기본값)
+2. 작업 완료 시 이전 프로파일로 자동 복귀
+3. `fan_profile` 파라미터로 작업별 프로파일 지정 가능
+
+> ⚠️ `aggressive` 모드에서는 팬 소음이 크게 증가합니다.
 
 ## Systemd Service
 
@@ -152,8 +197,11 @@ sudo systemctl restart jetson-mcp
 
 ## Roadmap
 
-- [ ] Async task queue (submit job, check later)
+- [x] Async task queue (submit job, check later)
+- [x] JetPack-safe package management
+- [x] Fan cooling control (manual + automatic)
 - [ ] ESP32 IoT data pipeline integration
+- [ ] Claude Agent SDK hybrid architecture (Mac Agent ↔ Jetson Agent)
 - [ ] Model inference endpoints (ONNX, TensorRT)
 - [ ] Resource monitoring dashboard
 
