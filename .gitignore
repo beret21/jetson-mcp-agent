@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
+.mcp.json
+
+# Private docs (contains credentials)
+jetson-mcp-handoff.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
