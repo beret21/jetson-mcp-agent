@@ -41,6 +41,23 @@ MCP 서버는 Python 3.10 venv에서 실행되고, PyTorch가 필요한 도구(`
 
 ## Quick Start
 
+### 0. Configuration (필수)
+
+배포 전에 `deploy.sh`를 열어서 **상단 2개 변수를 본인 환경에 맞게 수정**하세요:
+
+```bash
+# deploy.sh 상단
+JETSON_HOST="YOUR_JETSON_IP"       # ← Jetson의 IP 주소 (예: 192.168.1.100)
+JETSON_USER="YOUR_USERNAME"        # ← Jetson의 사용자명 (예: jetson)
+```
+
+SSH 키 인증도 미리 설정해야 합니다 (배포 스크립트가 SSH로 접속하므로):
+
+```bash
+# Mac에서 실행
+ssh-copy-id <user>@<jetson-ip>
+```
+
 ### 1. Deploy to Jetson
 
 ```bash
@@ -53,7 +70,7 @@ Or manually:
 
 ```bash
 # Transfer files
-scp jetson_mcp_server.py requirements.txt user@<jetson-ip>:~/mcp-server/
+scp jetson_mcp_server.py requirements.txt <user>@<jetson-ip>:~/mcp-server/
 
 # On Jetson
 cd ~/mcp-server
