@@ -43,9 +43,9 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 [Mac: Claude Code]  ──── Streamable HTTP ────▶  [Jetson Xavier: MCP Server]
                                                         │
                                                   ┌─────┴─────┐
-                                                  │ CUDA GPU   │
-                                                  │ PyTorch    │
-                                                  │ Shell/Py   │
+                                                  │ CUDA GPU  │
+                                                  │ PyTorch   │
+                                                  │ Shell/Py  │
                                                   └───────────┘
 ```
 
