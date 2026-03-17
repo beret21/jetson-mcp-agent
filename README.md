@@ -7,9 +7,9 @@ NVIDIA Jetson Xavier의 CUDA/GPU 자원을 [Claude Code](https://claude.ai/code)
 ```
 ┌──────────────┐   Streamable HTTP   ┌──────────────────────────────┐
 │  Mac         │                     │  Jetson Xavier               │
-│  Claude Code │ ◄──── :8765 ────►  │  MCP Server (Python 3.10)   │
+│  Claude Code │  ◄──── :8765 ────►  │  MCP Server (Python 3.10)    │
 │              │                     │     │                        │
-└──────────────┘                     │     ├─ CUDA 11.4 / GPU      │
+└──────────────┘                     │     ├─ CUDA 11.4 / GPU       │
                                      │     ├─ PyTorch (Python 3.8)  │
                                      │     └─ Shell / File I/O      │
                                      └──────────────────────────────┘
