@@ -14,13 +14,22 @@
 
 set -e
 
-# ── 설정 ────────────────────────────────────────────────────
-JETSON_HOST="\${JETSON_HOST:-YOUR_JETSON_IP}"
-JETSON_USER="\${JETSON_USER:-YOUR_USERNAME}"
-JETSON_DIR="/home/YOUR_USERNAME/mcp-server"
+# ── 설정 (본인 환경에 맞게 수정하세요) ─────────────────────────
+JETSON_HOST="${JETSON_HOST:-YOUR_JETSON_IP}"
+JETSON_USER="${JETSON_USER:-YOUR_USERNAME}"
+JETSON_DIR="/home/${JETSON_USER}/mcp-server"
 MCP_PORT=8765
 PYTHON310="/usr/local/bin/python3.10"
 VENV_DIR="${JETSON_DIR}/venv"
+
+if [ "$JETSON_HOST" = "YOUR_JETSON_IP" ] || [ "$JETSON_USER" = "YOUR_USERNAME" ]; then
+    echo "⚠️  먼저 환경 변수를 설정하세요:"
+    echo "   export JETSON_HOST=<Jetson IP>"
+    echo "   export JETSON_USER=<Jetson 사용자명>"
+    echo ""
+    echo "   또는 deploy.sh 상단의 기본값을 직접 수정하세요."
+    exit 1
+fi
 
 echo "📦 Jetson Xavier MCP Server 배포 시작"
 echo "   Target: ${JETSON_USER}@${JETSON_HOST}:${JETSON_DIR}"
@@ -64,20 +73,20 @@ ssh ${JETSON_USER}@${JETSON_HOST} "
 
 # ── 4. systemd 서비스 등록 ────────────────────────────────────
 echo "4️⃣  systemd 서비스 등록 중..."
-ssh ${JETSON_USER}@${JETSON_HOST} "cat > /tmp/jetson-mcp.service << 'UNIT'
+ssh ${JETSON_USER}@${JETSON_HOST} "cat > /tmp/jetson-mcp.service << UNIT
 [Unit]
 Description=Jetson Xavier MCP Server
 After=network.target
 
 [Service]
 Type=simple
-User=\${JETSON_USER}
-WorkingDirectory=/home/YOUR_USERNAME/mcp-server
-ExecStart=/home/YOUR_USERNAME/mcp-server/venv/bin/python3 /home/YOUR_USERNAME/mcp-server/jetson_mcp_server.py --port 8765
+User=${JETSON_USER}
+WorkingDirectory=${JETSON_DIR}
+ExecStart=${VENV_DIR}/bin/python3 ${JETSON_DIR}/jetson_mcp_server.py --port ${MCP_PORT}
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=PATH=/usr/local/cuda/bin:/home/YOUR_USERNAME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/usr/local/cuda/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
 [Install]
@@ -96,4 +105,4 @@ echo "   서버 로그 확인: ssh ${JETSON_USER}@${JETSON_HOST} 'sudo journalct
 echo "   MCP 엔드포인트: http://${JETSON_HOST}:${MCP_PORT}/mcp"
 echo ""
 echo "📝 Claude Code에서 연결하려면:"
-echo "   claude mcp add jetson-xavier --transport streamable-http http://\${JETSON_HOST}:\${MCP_PORT}/mcp"
+echo "   claude mcp add jetson-xavier --transport streamable-http http://${JETSON_HOST}:${MCP_PORT}/mcp"
