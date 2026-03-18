@@ -1658,6 +1658,30 @@ for line in lines:
         val = float(acc_match.group(1))
         accuracies.append(val if val <= 1 else val)
 
+    # 혼동행렬 파싱
+    cm_match = re.search(r'TP[=:\s]+(\d+).*?FP[=:\s]+(\d+).*?FN[=:\s]+(\d+).*?TN[=:\s]+(\d+)', line)
+    if cm_match:
+        metrics['confusion_matrix'] = {{'TP': int(cm_match.group(1)), 'FP': int(cm_match.group(2)),
+                                         'FN': int(cm_match.group(3)), 'TN': int(cm_match.group(4))}}
+
+    prec_match = re.search(r'[Pp]recision[=:\s]+([\\d.]+)%?', line)
+    rec_match = re.search(r'[Rr]ecall[=:\s]+([\\d.]+)%?', line)
+    f1_match = re.search(r'[Ff]1[=:\s]+([\\d.]+)%?', line)
+    if prec_match:
+        metrics['precision'] = float(prec_match.group(1))
+    if rec_match:
+        metrics['recall'] = float(rec_match.group(1))
+    if f1_match:
+        metrics['f1'] = float(f1_match.group(1))
+
+    # features/params 파싱
+    feat_match = re.search(r'[Ff]eatures?[=:\s]+(\d+)', line)
+    param_match = re.search(r'[Pp]arams?[=:\s]+([\d,]+)', line)
+    if feat_match:
+        metrics['features_used'] = int(feat_match.group(1))
+    if param_match:
+        metrics['params'] = int(param_match.group(1).replace(',', ''))
+
 result = {{"job_id": {repr(job_id)}, "status": {repr(j['status'])}}}
 
 if epochs:
@@ -1691,6 +1715,11 @@ if losses:
 
 result["summary"] = " ".join(summary_parts) if summary_parts else "학습 메트릭을 파싱할 수 없습니다."
 
+# 혼동행렬/precision/recall/f1/features 추가
+for key in ('confusion_matrix', 'precision', 'recall', 'f1', 'features_used', 'params'):
+    if key in metrics:
+        result[key] = metrics[key]
+
 if {repr(compact)}:
     print(json.dumps({{"summary": result["summary"],
                        "accuracy": result.get("accuracy", dict()).get("last"),
@@ -1707,14 +1736,364 @@ else:
         return {"output": result["stdout"]}
 
 
+async def _xai_diagnose(job_id, path, columns, threshold, compact) -> dict:
+    """학습 결과 + 데이터 특성을 결합한 종합 진단. EDA 반복 루프의 핵심."""
+    # 1. 학습 결과 파싱 (trace 재사용)
+    trace_result = await _xai_trace(job_id, False)
+    if "error" in trace_result:
+        return trace_result
+
+    # 2. 데이터 파일 경로 확인
+    if not os.path.isabs(path):
+        try:
+            path = _resolve_workspace_path(path)
+        except ValueError as e:
+            return {"error": str(e)}
+    if not os.path.exists(path):
+        return {"error": f"파일이 존재하지 않습니다: {path}"}
+
+    # 3. Python 3.8 진단 스크립트 생성
+    used_cols_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else []
+    code = f"""
+import json, sys, traceback
+try:
+    import pandas as pd
+    import numpy as np
+
+    df = pd.read_csv({repr(path)}, nrows=50000)
+    num_cols = [c for c in df.columns if df[c].dtype.kind in ('i', 'f')]
+    all_cols = list(df.columns)
+    used_cols = {repr(used_cols_list)} if {repr(bool(used_cols_list))} else num_cols[:20]
+
+    result = {{}}
+
+    # 사용/미사용 컬럼 분석
+    result['unused_columns'] = {{
+        'available': len(all_cols),
+        'numeric_available': len(num_cols),
+        'used': len(used_cols),
+        'unused_numeric': [c for c in num_cols if c not in used_cols][:15]
+    }}
+
+    # 다중공선성 분석
+    if len(num_cols) >= 2:
+        corr = df[num_cols].corr()
+        mc_pairs = []
+        for i in range(len(num_cols)):
+            for j in range(i+1, len(num_cols)):
+                r = abs(corr.iloc[i, j])
+                if r >= {threshold}:
+                    mc_pairs.append({{
+                        'col1': num_cols[i], 'col2': num_cols[j],
+                        'r': round(float(r), 4),
+                        'action': 'drop_one' if r > 0.95 else 'monitor'
+                    }})
+        mc_pairs.sort(key=lambda x: -x['r'])
+        result['multicollinearity'] = mc_pairs[:20]
+    else:
+        result['multicollinearity'] = []
+
+    # 저분산 컬럼
+    low_var = []
+    for c in num_cols:
+        if df[c].std() < 1e-6:
+            low_var.append(c)
+    result['low_variance'] = low_var
+
+    # 편향된 분포
+    skewed = []
+    for c in num_cols:
+        s = float(df[c].skew()) if df[c].std() > 0 else 0
+        if abs(s) > 2:
+            skewed.append({{'col': c, 'skewness': round(s, 2), 'action': 'log_transform' if s > 2 else 'reflect_log'}})
+    result['skewed_features'] = skewed[:10]
+
+    # 클래스 불균형 분석 (마지막 컬럼이 타겟이라 가정, 또는 object/category 컬럼)
+    cat_cols = [c for c in df.columns if df[c].dtype == 'object' or df[c].nunique() <= 10]
+    class_imbalance = {{'detected': False}}
+    for tc in reversed(cat_cols):
+        vc = df[tc].value_counts()
+        if len(vc) >= 2:
+            ratio = float(vc.min()) / float(vc.max())
+            if ratio < 0.5:
+                class_imbalance = {{
+                    'detected': True,
+                    'target_column': tc,
+                    'distribution': {{str(k): int(v) for k, v in vc.items()}},
+                    'ratio': round(ratio, 3),
+                    'action': 'class_weight' if ratio > 0.2 else 'oversampling'
+                }}
+                break
+    result['class_imbalance'] = class_imbalance
+
+    # 규칙 기반 추천 생성
+    recommendations = []
+    priority = 1
+
+    # 다중공선성 추천
+    perfect_mc = [p for p in result['multicollinearity'] if p['r'] > 0.95]
+    if perfect_mc:
+        drop_cols = [p['col2'] for p in perfect_mc[:5]]
+        recommendations.append({{
+            'priority': priority,
+            'category': 'multicollinearity',
+            'action': 'drop_redundant',
+            'description': f"완전 다중공선성 {{len(perfect_mc)}}쌍 발견. 중복 컬럼 제거 필요.",
+            'columns_to_drop': drop_cols,
+            'expected_impact': '모델 안정성 대폭 향상'
+        }})
+        priority += 1
+
+    # 미사용 컬럼 추천
+    unused_n = result['unused_columns']['numeric_available'] - result['unused_columns']['used']
+    if unused_n > 5:
+        recommendations.append({{
+            'priority': priority,
+            'category': 'feature_selection',
+            'action': 'add_features',
+            'description': f"{{unused_n}}개 수치형 컬럼 미사용. 추가 피처 탐색 권장.",
+            'candidate_columns': result['unused_columns']['unused_numeric'][:10],
+            'expected_impact': '모델 표현력 향상'
+        }})
+        priority += 1
+
+    # 편향 분포 추천
+    if result['skewed_features']:
+        recommendations.append({{
+            'priority': priority,
+            'category': 'distribution',
+            'action': 'transform_skewed',
+            'description': f"{{len(result['skewed_features'])}}개 컬럼 심한 편향. 로그/sqrt 변환 권장.",
+            'columns': [s['col'] for s in result['skewed_features']],
+            'expected_impact': '정규성 개선, 모델 학습 안정화'
+        }})
+        priority += 1
+
+    # 클래스 불균형 추천
+    if class_imbalance['detected']:
+        recommendations.append({{
+            'priority': priority,
+            'category': 'class_imbalance',
+            'action': class_imbalance['action'],
+            'description': f"클래스 불균형 (비율 {{class_imbalance['ratio']}}). {{class_imbalance['action']}} 적용 권장.",
+            'expected_impact': 'FN 감소, 소수 클래스 탐지율 향상'
+        }})
+        priority += 1
+
+    # 피처 엔지니어링 추천 (시계열 패턴)
+    velocity_cols = [c for c in num_cols if 'velocity' in c.lower() or 'speed' in c.lower()]
+    accel_cols = [c for c in num_cols if 'accel' in c.lower()]
+    if velocity_cols or accel_cols:
+        recommendations.append({{
+            'priority': priority,
+            'category': 'feature_engineering',
+            'action': 'add_rolling_stats',
+            'description': '시계열 센서 데이터에 rolling mean/std 추가로 시간적 패턴 포착 권장.',
+            'columns': (velocity_cols + accel_cols)[:6],
+            'window_sizes': [5, 10, 50],
+            'expected_impact': '시간적 패턴 포착, 분류 성능 향상'
+        }})
+        priority += 1
+
+    # StandardScaler 추천
+    ranges = []
+    for c in num_cols[:20]:
+        r = float(df[c].max() - df[c].min())
+        if r > 0:
+            ranges.append(r)
+    if ranges and max(ranges) / (min(ranges) + 1e-10) > 100:
+        recommendations.append({{
+            'priority': priority,
+            'category': 'preprocessing',
+            'action': 'standardize',
+            'description': '피처 스케일 차이 큼. StandardScaler 적용 권장.',
+            'expected_impact': '그래디언트 안정화, 학습 속도 향상'
+        }})
+
+    result['recommendations'] = recommendations
+
+    # 심각도 판단
+    n_critical = len(perfect_mc)
+    if n_critical >= 3 or (class_imbalance['detected'] and class_imbalance.get('ratio', 1) < 0.3):
+        result['severity'] = 'critical'
+    elif n_critical >= 1 or len(result['skewed_features']) >= 3:
+        result['severity'] = 'warning'
+    else:
+        result['severity'] = 'info'
+
+    # 요약
+    parts = []
+    parts.append(f"{{len(all_cols)}}컬럼 중 {{len(used_cols)}}개 사용")
+    if perfect_mc:
+        parts.append(f"완전 다중공선성 {{len(perfect_mc)}}쌍")
+    if class_imbalance['detected']:
+        parts.append(f"클래스 불균형 (비율 {{class_imbalance['ratio']}})")
+    if result['skewed_features']:
+        parts.append(f"심한 편향 {{len(result['skewed_features'])}}컬럼")
+    result['summary'] = ". ".join(parts) + "."
+
+    print(json.dumps(result, default=str, ensure_ascii=False))
+
+except Exception as e:
+    print(json.dumps({{"error": traceback.format_exc()}}))
+"""
+
+    # 진단 스크립트 실행
+    diag_result = await _execute_python(code, timeout=120, compact=False)
+    if diag_result["exit_code"] != 0:
+        return {"error": f"diagnose 실패: {diag_result['stderr'] or diag_result['stdout']}"}
+    try:
+        data_diag = json.loads(diag_result["stdout"])
+    except json.JSONDecodeError:
+        return {"error": f"diagnose JSON 파싱 실패: {diag_result['stdout'][:500]}"}
+
+    # trace 결과와 결합
+    final = {
+        "iteration_context": {
+            "job_id": job_id,
+            "accuracy": trace_result.get("accuracy", {}).get("last"),
+            "convergence": trace_result.get("convergence", "unknown"),
+            "loss_trend": trace_result.get("loss", {}).get("trend"),
+            "confusion_matrix": trace_result.get("confusion_matrix"),
+            "features_used": trace_result.get("features_used"),
+        },
+        "data_issues": {
+            "multicollinearity": data_diag.get("multicollinearity", []),
+            "low_variance": data_diag.get("low_variance", []),
+            "skewed_features": data_diag.get("skewed_features", []),
+            "unused_columns": data_diag.get("unused_columns", {}),
+            "class_imbalance": data_diag.get("class_imbalance", {}),
+        },
+        "recommendations": data_diag.get("recommendations", []),
+        "severity": data_diag.get("severity", "info"),
+        "summary": data_diag.get("summary", ""),
+    }
+
+    if compact:
+        return {
+            "severity": final["severity"],
+            "summary": final["summary"],
+            "recommendations": len(final["recommendations"]),
+            "accuracy": final["iteration_context"]["accuracy"],
+            "convergence": final["iteration_context"]["convergence"],
+        }
+    return final
+
+
+async def _xai_compare(job_ids_str, compact) -> dict:
+    """여러 반복 학습 결과를 비교하고 중단 여부를 판단합니다."""
+    job_ids = [jid.strip() for jid in job_ids_str.split(",") if jid.strip()]
+    if len(job_ids) < 2:
+        return {"error": "최소 2개 이상의 job_id가 필요합니다. 쉼표로 구분하세요."}
+
+    iterations = []
+    for idx, jid in enumerate(job_ids):
+        trace = await _xai_trace(jid, False)
+        if "error" in trace:
+            iterations.append({"job_id": jid, "iteration": idx + 1, "error": trace["error"]})
+            continue
+        iterations.append({
+            "job_id": jid,
+            "iteration": idx + 1,
+            "accuracy": trace.get("accuracy", {}).get("last"),
+            "convergence": trace.get("convergence", "unknown"),
+            "loss_first": trace.get("loss", {}).get("first"),
+            "loss_last": trace.get("loss", {}).get("last"),
+            "features_used": trace.get("features_used"),
+            "confusion_matrix": trace.get("confusion_matrix"),
+            "total_epochs": trace.get("total_epochs"),
+        })
+
+    # 정확도 추이 계산
+    accuracies = [it.get("accuracy") for it in iterations]
+    deltas = [None]
+    for i in range(1, len(accuracies)):
+        if accuracies[i] is not None and accuracies[i-1] is not None:
+            deltas.append(round(accuracies[i] - accuracies[i-1], 2))
+        else:
+            deltas.append(None)
+
+    valid_acc = [a for a in accuracies if a is not None]
+    best_idx = accuracies.index(max(valid_acc)) + 1 if valid_acc else 0
+    best_acc = max(valid_acc) if valid_acc else 0
+
+    # 추세 판단
+    if len(valid_acc) >= 2:
+        if valid_acc[-1] > valid_acc[-2] + 1:
+            trend = "improving"
+        elif valid_acc[-1] < valid_acc[-2] - 1:
+            trend = "degrading"
+        else:
+            trend = "plateau"
+    else:
+        trend = "unknown"
+
+    # 중단 추천
+    should_stop = False
+    reason = ""
+    if best_acc >= 95:
+        should_stop = True
+        reason = f"목표 정확도 달성 ({best_acc}%). 추가 반복 불필요."
+    elif len(valid_acc) >= 3:
+        recent_deltas = [d for d in deltas[-2:] if d is not None]
+        if recent_deltas and all(abs(d) < 1.0 for d in recent_deltas):
+            should_stop = True
+            reason = "2회 연속 <1%p 개선. 수렴 정체로 판단."
+    elif len(valid_acc) >= 2 and valid_acc[-1] < valid_acc[-2] - 5:
+        should_stop = True
+        reason = f"정확도 하락 ({valid_acc[-2]}% → {valid_acc[-1]}%). 이전 반복 결과 사용 권장."
+
+    if not should_stop:
+        if len(iterations) >= 5:
+            should_stop = True
+            reason = "최대 반복 횟수(5회) 도달."
+        else:
+            last_delta = deltas[-1] if deltas[-1] is not None else 0
+            reason = f"+{last_delta}%p 개선. 추가 반복 권장." if last_delta > 0 else "추가 반복으로 개선 시도 권장."
+
+    progression = {
+        "accuracy_delta": deltas,
+        "best_iteration": best_idx,
+        "best_accuracy": best_acc,
+        "trend": trend,
+    }
+
+    stop_rec = {
+        "should_stop": should_stop,
+        "reason": reason,
+    }
+
+    # 요약 생성
+    acc_str = " → ".join(f"{a}%" if a is not None else "N/A" for a in accuracies)
+    total_delta = round(valid_acc[-1] - valid_acc[0], 2) if len(valid_acc) >= 2 else 0
+    summary = f"{len(iterations)}회 반복: {acc_str} (총 {'+' if total_delta >= 0 else ''}{total_delta}%p)"
+
+    result = {
+        "iterations": iterations,
+        "progression": progression,
+        "stop_recommendation": stop_rec,
+        "summary": summary,
+    }
+
+    if compact:
+        return {
+            "summary": summary,
+            "best_accuracy": best_acc,
+            "trend": trend,
+            "should_stop": should_stop,
+            "reason": reason,
+        }
+    return result
+
+
 @mcp.tool()
 async def xai(action: str, path: str = "", job_id: str = "",
-              columns: str = "", method: str = "auto",
+              job_ids: str = "", columns: str = "", method: str = "auto",
               threshold: float = 0.7, focus: str = "all",
               compact: bool = False) -> dict:
     """
     XAI(설명가능AI) 분석 — 데이터와 모델 결과를 사람이 이해할 수 있게 설명합니다.
-    EDA Reasoning Loop: Detection → Reasoning → Narrative.
+    EDA Reasoning Loop: Detection → Reasoning → Narrative → Action → 반복.
 
     Args:
         action: 수행할 작업
@@ -1723,8 +2102,11 @@ async def xai(action: str, path: str = "", job_id: str = "",
             - "outliers": 이상치 탐지 + 영향도 분석
             - "profile": 데이터 프로파일링 (분포, 편향, 결측 패턴, 카디널리티)
             - "trace": 학습 작업 결과 해석 (loss/accuracy 추세, 수렴 판단)
+            - "diagnose": 학습 결과 + 데이터 특성 종합 진단 (피처 엔지니어링 추천 포함)
+            - "compare": 여러 반복 학습 결과 비교 (정확도 추이, 중단 판단)
         path: 분석 대상 데이터 파일 (워크스페이스 상대경로 가능)
-        job_id: trace에서 분석할 작업 ID
+        job_id: trace/diagnose에서 분석할 작업 ID
+        job_ids: compare에서 비교할 작업 ID 목록 (쉼표 구분, 시간순)
         columns: 특정 컬럼만 분석 (쉼표 구분, 비우면 전체)
         method: 이상치 탐지 방법 (auto/iqr/zscore)
         threshold: 상관관계 임계값 (기본 0.7)
@@ -1740,8 +2122,16 @@ async def xai(action: str, path: str = "", job_id: str = "",
             if not job_id:
                 return {"error": "job_id를 지정하세요."}
             return await _xai_trace(job_id, compact)
+        elif action == "diagnose":
+            if not job_id or not path:
+                return {"error": "diagnose에는 job_id와 path가 모두 필요합니다."}
+            return await _xai_diagnose(job_id, path, columns, threshold, compact)
+        elif action == "compare":
+            if not job_ids:
+                return {"error": "compare에는 job_ids(쉼표 구분)가 필요합니다."}
+            return await _xai_compare(job_ids, compact)
         else:
-            return {"error": f"Unknown action: {action}. Use: explain, correlate, outliers, profile, trace"}
+            return {"error": f"Unknown action: {action}. Use: explain, correlate, outliers, profile, trace, diagnose, compare"}
     except Exception as e:
         return {"error": f"xai error: {traceback.format_exc()}"}
 
