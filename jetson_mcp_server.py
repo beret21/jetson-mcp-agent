@@ -41,7 +41,10 @@ mcp = FastMCP(
 PYTHON38 = "/usr/bin/python3.8"
 CUDA_ENV = "export PATH=/usr/local/cuda/bin:$HOME/.local/bin:$PATH && export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
-FAN_PROFILE_PATH = "/sys/devices/platform/thermal_fan_est/fan_profile"
+WORKSPACE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+WORKSPACE_INDEX = os.path.join(WORKSPACE_ROOT, ".workspace.json")
+DUCKDB_PATH = os.path.join(WORKSPACE_ROOT, "analytics.duckdb")
+FAN_CONFIG_PATH = "/etc/nvfancontrol.conf"
 FAN_PROFILES_INFO = {
     "quiet": "소음 최소. 50°C부터 팬 시작, 유휴 시 팬 정지.",
     "cool": "균형 모드. 35°C부터 팬 시작, 일반 운영에 적합.",
@@ -51,6 +54,7 @@ FAN_PROFILES_INFO = {
 
 async def run_cmd(cmd: str, timeout: int = 60) -> dict:
     """쉘 커맨드를 비동기로 실행하고 결과를 반환합니다."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -64,26 +68,44 @@ async def run_cmd(cmd: str, timeout: int = 60) -> dict:
             "stderr": stderr.decode("utf-8", errors="replace").strip(),
         }
     except asyncio.TimeoutError:
-        proc.kill()
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()  # 좀비 프로세스 방지
+            except ProcessLookupError:
+                pass
         return {"exit_code": -1, "stdout": "", "stderr": f"Command timed out after {timeout}s"}
     except Exception as e:
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except (ProcessLookupError, OSError):
+                pass
         return {"exit_code": -1, "stdout": "", "stderr": str(e)}
 
 
 # ── 팬 제어 헬퍼 ─────────────────────────────────────────────
 async def _get_fan_profile() -> str:
-    """현재 팬 프로파일을 반환합니다."""
-    result = await run_cmd(f"cat {FAN_PROFILE_PATH}")
-    return result["stdout"].strip()
+    """현재 팬 프로파일을 반환합니다 (nvfancontrol.conf에서 읽기)."""
+    result = await run_cmd(f"grep 'FAN_DEFAULT_PROFILE' {FAN_CONFIG_PATH}")
+    line = result["stdout"].strip()
+    return line.split()[-1] if line else "unknown"
 
 
 async def _set_fan_profile(profile: str) -> dict:
-    """팬 프로파일을 변경합니다."""
+    """팬 프로파일을 변경합니다 (nvfancontrol.conf 수정 + 서비스 재시작)."""
     if profile not in FAN_PROFILES_INFO:
         return {"error": f"Invalid profile: {profile}. Use: {', '.join(FAN_PROFILES_INFO)}"}
-    result = await run_cmd(f"sudo sh -c 'echo {profile} > {FAN_PROFILE_PATH}'")
+    # 1. 설정 파일의 FAN_DEFAULT_PROFILE 변경
+    sed_cmd = f"sudo sed -i 's/FAN_DEFAULT_PROFILE .*/FAN_DEFAULT_PROFILE {profile}/' {FAN_CONFIG_PATH}"
+    result = await run_cmd(sed_cmd)
     if result["exit_code"] != 0:
-        return {"error": f"Failed to set fan profile: {result['stderr']}"}
+        return {"error": f"Failed to update config: {result['stderr']}"}
+    # 2. nvfancontrol 서비스 재시작하여 적용
+    restart = await run_cmd("sudo systemctl restart nvfancontrol")
+    if restart["exit_code"] != 0:
+        return {"error": f"Failed to restart nvfancontrol: {restart['stderr']}"}
     return {"profile": profile, "description": FAN_PROFILES_INFO[profile]}
 
 
@@ -173,10 +195,11 @@ async def execute_command(command: str, timeout: int = 120) -> dict:
         timeout: 타임아웃(초), 기본 120초
     """
     # 보안: 위험한 명령어 차단
-    dangerous = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd"]
+    dangerous = ["rm -rf /", "rm -rf /*", "mkfs", "dd if=", "> /dev/sd", ":(){ :|:", "chmod -R 777 /", "chown -R", "> /dev/null", "shutdown", "reboot", "init 0", "halt"]
+    cmd_lower = command.lower().strip()
     for d in dangerous:
-        if d in command:
-            return {"exit_code": -1, "stdout": "", "stderr": f"Blocked dangerous command: {d}"}
+        if d in cmd_lower:
+            return {"exit_code": -1, "stdout": "", "stderr": f"Blocked dangerous command pattern: {d}"}
 
     return await run_cmd(command, timeout=min(timeout, 600))
 
@@ -192,17 +215,19 @@ async def run_python(code: str, timeout: int = 300) -> dict:
         timeout: 타임아웃(초), 기본 300초
     """
     # 임시 파일에 코드 저장 후 Python 3.8(PyTorch/CUDA)으로 실행
-    tmp_path = "/tmp/mcp_python_task.py"
+    # 고유 파일명으로 동시 호출 충돌 방지
+    tmp_path = f"/tmp/mcp_python_{uuid.uuid4().hex[:8]}.py"
     with open(tmp_path, "w") as f:
         f.write(code)
 
-    result = await run_cmd(f"{CUDA_ENV} && {PYTHON38} {tmp_path}", timeout=min(timeout, 600))
-
-    # 임시 파일 정리
     try:
-        os.remove(tmp_path)
-    except:
-        pass
+        result = await run_cmd(f"{CUDA_ENV} && {PYTHON38} {tmp_path}", timeout=min(timeout, 600))
+    finally:
+        # 임시 파일 정리 (성공/실패 무관)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     return result
 
@@ -217,9 +242,28 @@ async def read_file(path: str) -> dict:
         path: 읽을 파일의 절대 경로
     """
     try:
+        file_size = os.path.getsize(path)
+        # 바이너리 파일 감지 (이미지, 모델 등)
+        binary_exts = {".bin", ".pt", ".pth", ".onnx", ".pb", ".h5", ".pkl",
+                       ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff",
+                       ".mp4", ".avi", ".wav", ".mp3", ".so", ".o", ".a"}
+        ext = os.path.splitext(path)[1].lower()
+        if ext in binary_exts:
+            return {
+                "success": True,
+                "content": f"(바이너리 파일 — 내용 표시 불가)",
+                "size": file_size,
+                "type": "binary",
+                "extension": ext,
+            }
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(1_000_000)  # 최대 1MB
-        return {"success": True, "content": content, "size": os.path.getsize(path)}
+        truncated = file_size > 1_000_000
+        result = {"success": True, "content": content, "size": file_size}
+        if truncated:
+            result["truncated"] = True
+            result["message"] = f"파일이 1MB를 초과하여 잘렸습니다. 전체 크기: {file_size:,} bytes"
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -456,9 +500,12 @@ def _job_path(job_id: str) -> str:
 
 
 def _save_job(job: dict) -> None:
-    """작업 상태를 JSON 파일로 저장합니다."""
-    with open(_job_path(job["id"]), "w") as f:
+    """작업 상태를 JSON 파일로 안전하게 저장합니다 (atomic write)."""
+    path = _job_path(job["id"])
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(job, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)  # atomic — 동시 쓰기 시 파일 깨짐 방지
 
 
 def _load_job(job_id: str) -> dict | None:
@@ -488,6 +535,8 @@ def _read_log(job_id: str, tail: int = 20) -> str:
 async def _run_job_with_log(job_id: str, cmd: str, timeout: int) -> dict:
     """커맨드를 실행하면서 stdout/stderr를 로그 파일에 실시간 기록합니다."""
     log_file = _log_path(job_id)
+    output_lines = []  # try 블록 밖에서 선언하여 except에서도 접근 가능
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -495,7 +544,6 @@ async def _run_job_with_log(job_id: str, cmd: str, timeout: int) -> dict:
             stderr=asyncio.subprocess.STDOUT,  # stderr를 stdout에 합침
         )
 
-        output_lines = []
         with open(log_file, "w", encoding="utf-8") as lf:
             async def read_stream():
                 while True:
@@ -516,10 +564,21 @@ async def _run_job_with_log(job_id: str, cmd: str, timeout: int) -> dict:
             "stderr": "",
         }
     except asyncio.TimeoutError:
-        proc.kill()
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
         return {"exit_code": -1, "stdout": "".join(output_lines).strip(), "stderr": f"Command timed out after {timeout}s"}
     except Exception as e:
-        return {"exit_code": -1, "stdout": "", "stderr": str(e)}
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except (ProcessLookupError, OSError):
+                pass
+        return {"exit_code": -1, "stdout": "".join(output_lines).strip(), "stderr": str(e)}
 
 
 async def _run_job(job_id: str) -> None:
@@ -639,7 +698,11 @@ async def submit_job(
     _save_job(job)
 
     # 백그라운드에서 실행 (현재 이벤트 루프에 태스크 추가)
-    asyncio.get_event_loop().create_task(_run_job(job_id))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    loop.create_task(_run_job(job_id))
 
     response = {
         "job_id": job_id,
@@ -768,6 +831,798 @@ async def get_log(job_id: str, tail: int = 50) -> dict:
     return info
 
 
+# ── 워크스페이스 헬퍼 ──────────────────────────────────────────
+
+def _resolve_workspace_path(name: str) -> str:
+    """워크스페이스 상대 경로를 절대 경로로 변환 (경로 탈출 방지)."""
+    resolved = os.path.realpath(os.path.join(WORKSPACE_ROOT, name))
+    if not resolved.startswith(os.path.realpath(WORKSPACE_ROOT)):
+        raise ValueError(f"Path traversal detected: {name}")
+    return resolved
+
+
+def _load_workspace_index() -> dict:
+    """워크스페이스 인덱스를 로드합니다."""
+    if os.path.exists(WORKSPACE_INDEX):
+        with open(WORKSPACE_INDEX, "r") as f:
+            return json.load(f)
+    return {"created": datetime.now().isoformat(), "versions": {}}
+
+
+def _save_workspace_index(index: dict) -> None:
+    """워크스페이스 인덱스를 저장합니다."""
+    with open(WORKSPACE_INDEX, "w") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+async def _dir_size(path: str) -> int:
+    """디렉토리 전체 크기(bytes)를 반환합니다."""
+    result = await run_cmd(f"du -sb {shlex.quote(path)} 2>/dev/null")
+    if result["exit_code"] == 0 and result["stdout"]:
+        return int(result["stdout"].split()[0])
+    return 0
+
+
+def _human_size(size_bytes: int) -> str:
+    """바이트를 사람이 읽기 쉬운 형태로 변환합니다."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size_bytes) < 1024.0:
+            return f"{size_bytes:.1f}{unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f}PB"
+
+
+# ── Tool: 워크스페이스 관리 ───────────────────────────────────
+@mcp.tool()
+async def workspace(
+    action: str,
+    name: str = "",
+    source: str = "",
+    description: str = "",
+    pattern: str = "",
+) -> dict:
+    """
+    EDA 데이터 워크스페이스를 관리합니다. 데이터 버전 관리, 포크, 정리 등.
+
+    Args:
+        action: 수행할 작업
+            - "init": 워크스페이스 초기화 (디렉토리 구조 생성)
+            - "status": 전체 현황 (디스크 사용량, 버전 목록)
+            - "list": 특정 버전 파일 목록 (name으로 지정, pattern으로 필터)
+            - "fork": source에서 name으로 데이터 복사 (새 버전 생성)
+            - "diff": source와 name 두 버전의 파일 차이 비교
+            - "info": 특정 버전 상세 정보
+            - "delete": 버전 삭제 (raw는 보호)
+        name: 대상 버전/디렉토리 이름 (예: "v1", "raw", "results")
+        source: fork/diff에서 원본 버전 이름 (예: "raw", "v1")
+        description: fork 생성 시 버전 설명
+        pattern: list에서 파일 필터 glob 패턴 (예: "*.csv")
+    """
+    try:
+        if action == "init":
+            return await _ws_init()
+        elif action == "status":
+            return await _ws_status()
+        elif action == "list":
+            return await _ws_list(name, pattern)
+        elif action == "fork":
+            return await _ws_fork(name, source, description)
+        elif action == "diff":
+            return await _ws_diff(name, source)
+        elif action == "info":
+            return await _ws_info(name)
+        elif action == "delete":
+            return await _ws_delete(name)
+        else:
+            return {"error": f"Unknown action: {action}. Use: init, status, list, fork, diff, info, delete"}
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Workspace error: {traceback.format_exc()}"}
+
+
+async def _ws_init() -> dict:
+    """워크스페이스 디렉토리 구조를 생성합니다."""
+    dirs = ["raw", "results"]
+    created = []
+    for d in dirs:
+        path = os.path.join(WORKSPACE_ROOT, d)
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            created.append(d)
+
+    index = _load_workspace_index()
+    if "raw" not in index["versions"]:
+        index["versions"]["raw"] = {
+            "created": datetime.now().isoformat(),
+            "source": None,
+            "description": "원본 데이터 (보호됨)",
+            "protected": True,
+        }
+    _save_workspace_index(index)
+
+    return {
+        "workspace_root": WORKSPACE_ROOT,
+        "created_dirs": created or "(이미 존재)",
+        "message": "워크스페이스가 초기화되었습니다.",
+    }
+
+
+async def _ws_status() -> dict:
+    """워크스페이스 전체 현황을 반환합니다."""
+    if not os.path.exists(WORKSPACE_ROOT):
+        return {"error": "워크스페이스가 초기화되지 않았습니다. workspace(action='init')을 먼저 실행하세요."}
+
+    # 디스크 사용량
+    disk = await run_cmd(f"df -h {shlex.quote(WORKSPACE_ROOT)} | tail -1")
+    disk_info = {}
+    if disk["exit_code"] == 0:
+        parts = disk["stdout"].split()
+        if len(parts) >= 5:
+            disk_info = {"total": parts[1], "used": parts[2], "available": parts[3], "usage_percent": parts[4]}
+
+    # 버전 목록
+    index = _load_workspace_index()
+    versions = []
+    for vname, vmeta in index.get("versions", {}).items():
+        vpath = os.path.join(WORKSPACE_ROOT, vname)
+        if os.path.exists(vpath):
+            size = await _dir_size(vpath)
+            file_count = sum(1 for f in os.listdir(vpath) if not f.startswith("."))
+            versions.append({
+                "name": vname,
+                "files": file_count,
+                "size": _human_size(size),
+                "created": vmeta.get("created", ""),
+                "source": vmeta.get("source"),
+                "description": vmeta.get("description", ""),
+                "protected": vmeta.get("protected", False),
+            })
+
+    # 인덱스에 없지만 존재하는 디렉토리도 표시
+    for d in sorted(os.listdir(WORKSPACE_ROOT)):
+        dpath = os.path.join(WORKSPACE_ROOT, d)
+        if os.path.isdir(dpath) and not d.startswith(".") and d not in index.get("versions", {}):
+            size = await _dir_size(dpath)
+            file_count = sum(1 for f in os.listdir(dpath) if not f.startswith("."))
+            versions.append({
+                "name": d,
+                "files": file_count,
+                "size": _human_size(size),
+                "created": "",
+                "source": None,
+                "description": "(인덱스에 미등록)",
+            })
+
+    # DuckDB 상태
+    db_info = None
+    if os.path.exists(DUCKDB_PATH):
+        db_size = os.path.getsize(DUCKDB_PATH)
+        db_info = {"path": DUCKDB_PATH, "size": _human_size(db_size)}
+
+    ws_size = await _dir_size(WORKSPACE_ROOT)
+
+    return {
+        "workspace_root": WORKSPACE_ROOT,
+        "total_size": _human_size(ws_size),
+        "disk": disk_info,
+        "versions": versions,
+        "duckdb": db_info,
+    }
+
+
+async def _ws_list(name: str, pattern: str) -> dict:
+    """특정 버전의 파일 목록을 반환합니다."""
+    if not name:
+        return {"error": "name을 지정하세요 (예: 'raw', 'v1')"}
+
+    vpath = _resolve_workspace_path(name)
+    if not os.path.exists(vpath):
+        return {"error": f"버전 '{name}'이 존재하지 않습니다."}
+
+    if pattern:
+        import glob as globmod
+        files_full = globmod.glob(os.path.join(vpath, pattern))
+        files = [os.path.basename(f) for f in files_full]
+    else:
+        files = [f for f in os.listdir(vpath) if not f.startswith(".")]
+
+    file_details = []
+    for fname in sorted(files):
+        fpath = os.path.join(vpath, fname)
+        if os.path.isfile(fpath):
+            stat = os.stat(fpath)
+            detail = {
+                "name": fname,
+                "size": _human_size(stat.st_size),
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            }
+            # CSV/Parquet 행 수 빠르게 확인
+            if fname.endswith(".csv"):
+                wc = await run_cmd(f"wc -l < {shlex.quote(fpath)}")
+                if wc["exit_code"] == 0:
+                    detail["rows"] = int(wc["stdout"].strip()) - 1  # 헤더 제외
+            file_details.append(detail)
+        elif os.path.isdir(fpath):
+            file_details.append({"name": fname + "/", "type": "directory"})
+
+    return {"version": name, "path": vpath, "files": file_details, "total": len(file_details)}
+
+
+async def _ws_fork(name: str, source: str, description: str) -> dict:
+    """source에서 name으로 데이터를 복사하여 새 버전을 생성합니다."""
+    if not name:
+        return {"error": "name을 지정하세요 (예: 'v1', 'v2')"}
+    if not source:
+        return {"error": "source를 지정하세요 (예: 'raw', 'v1')"}
+
+    src_path = _resolve_workspace_path(source)
+    dst_path = _resolve_workspace_path(name)
+
+    if not os.path.exists(src_path):
+        return {"error": f"원본 '{source}'가 존재하지 않습니다."}
+    if os.path.exists(dst_path):
+        return {"error": f"대상 '{name}'이 이미 존재합니다. 다른 이름을 사용하세요."}
+
+    # 디스크 잔여 공간 확인
+    src_size = await _dir_size(src_path)
+    disk = await run_cmd(f"df --output=avail -B1 {shlex.quote(WORKSPACE_ROOT)} | tail -1")
+    if disk["exit_code"] == 0:
+        avail = int(disk["stdout"].strip())
+        if src_size > avail * 0.9:  # 90% 이상 사용 시 거부
+            return {"error": f"디스크 공간 부족. 필요: {_human_size(src_size)}, 가용: {_human_size(avail)}"}
+
+    # 복사
+    result = await run_cmd(f"cp -r {shlex.quote(src_path)} {shlex.quote(dst_path)}", timeout=300)
+    if result["exit_code"] != 0:
+        return {"error": f"복사 실패: {result['stderr']}"}
+
+    # 메타데이터 저장
+    meta = {
+        "name": name,
+        "created": datetime.now().isoformat(),
+        "source": source,
+        "description": description or f"Forked from {source}",
+    }
+    with open(os.path.join(dst_path, "metadata.json"), "w") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # 인덱스 업데이트
+    index = _load_workspace_index()
+    index["versions"][name] = meta
+    _save_workspace_index(index)
+
+    new_size = await _dir_size(dst_path)
+    disk2 = await run_cmd(f"df --output=avail -B1 {shlex.quote(WORKSPACE_ROOT)} | tail -1")
+    remaining = int(disk2["stdout"].strip()) if disk2["exit_code"] == 0 else 0
+
+    return {
+        "message": f"'{source}' → '{name}' 포크 완료",
+        "version": name,
+        "size": _human_size(new_size),
+        "disk_remaining": _human_size(remaining),
+        "description": meta["description"],
+    }
+
+
+async def _ws_diff(name: str, source: str) -> dict:
+    """두 버전의 파일 차이를 비교합니다."""
+    if not name or not source:
+        return {"error": "name과 source를 모두 지정하세요."}
+
+    src_path = _resolve_workspace_path(source)
+    dst_path = _resolve_workspace_path(name)
+
+    if not os.path.exists(src_path):
+        return {"error": f"'{source}'가 존재하지 않습니다."}
+    if not os.path.exists(dst_path):
+        return {"error": f"'{name}'이 존재하지 않습니다."}
+
+    src_files = {f for f in os.listdir(src_path) if not f.startswith(".")}
+    dst_files = {f for f in os.listdir(dst_path) if not f.startswith(".")}
+
+    only_in_source = sorted(src_files - dst_files)
+    only_in_target = sorted(dst_files - src_files)
+    common = sorted(src_files & dst_files)
+
+    changed = []
+    unchanged = []
+    for fname in common:
+        sf = os.path.join(src_path, fname)
+        df = os.path.join(dst_path, fname)
+        if os.path.isfile(sf) and os.path.isfile(df):
+            s_size = os.path.getsize(sf)
+            d_size = os.path.getsize(df)
+            if s_size != d_size:
+                changed.append({"file": fname, f"{source}_size": _human_size(s_size), f"{name}_size": _human_size(d_size)})
+            else:
+                unchanged.append(fname)
+        else:
+            unchanged.append(fname)
+
+    return {
+        "source": source,
+        "target": name,
+        f"only_in_{source}": only_in_source,
+        f"only_in_{name}": only_in_target,
+        "changed": changed,
+        "unchanged_count": len(unchanged),
+    }
+
+
+async def _ws_info(name: str) -> dict:
+    """특정 버전의 상세 정보를 반환합니다."""
+    if not name:
+        return {"error": "name을 지정하세요."}
+
+    vpath = _resolve_workspace_path(name)
+    if not os.path.exists(vpath):
+        return {"error": f"'{name}'이 존재하지 않습니다."}
+
+    index = _load_workspace_index()
+    meta = index.get("versions", {}).get(name, {})
+
+    # lineage 추적
+    lineage = [name]
+    current = name
+    while True:
+        src = index.get("versions", {}).get(current, {}).get("source")
+        if src and src in index.get("versions", {}):
+            lineage.insert(0, src)
+            current = src
+        else:
+            break
+
+    size = await _dir_size(vpath)
+    file_count = sum(1 for f in os.listdir(vpath) if not f.startswith("."))
+
+    return {
+        "name": name,
+        "path": vpath,
+        "size": _human_size(size),
+        "files": file_count,
+        "created": meta.get("created", ""),
+        "source": meta.get("source"),
+        "description": meta.get("description", ""),
+        "protected": meta.get("protected", False),
+        "lineage": " → ".join(lineage),
+    }
+
+
+async def _ws_delete(name: str) -> dict:
+    """버전을 삭제합니다."""
+    if not name:
+        return {"error": "name을 지정하세요."}
+
+    index = _load_workspace_index()
+    meta = index.get("versions", {}).get(name, {})
+
+    if meta.get("protected"):
+        return {"error": f"'{name}'은 보호된 디렉토리입니다. 삭제할 수 없습니다."}
+
+    vpath = _resolve_workspace_path(name)
+    if not os.path.exists(vpath):
+        return {"error": f"'{name}'이 존재하지 않습니다."}
+
+    size = await _dir_size(vpath)
+
+    result = await run_cmd(f"rm -rf {shlex.quote(vpath)}")
+    if result["exit_code"] != 0:
+        return {"error": f"삭제 실패: {result['stderr']}"}
+
+    # 인덱스에서 제거
+    if name in index.get("versions", {}):
+        del index["versions"][name]
+        _save_workspace_index(index)
+
+    return {
+        "message": f"'{name}' 삭제 완료",
+        "freed": _human_size(size),
+    }
+
+
+# ── Tool: 데이터 업로드 (Mac → Jetson) ────────────────────────
+@mcp.tool()
+async def upload_data(
+    filename: str,
+    content_base64: str = "",
+    content_text: str = "",
+    dest: str = "raw",
+    overwrite: bool = False,
+) -> dict:
+    """
+    Mac에서 Jetson으로 데이터를 업로드합니다.
+    텍스트 파일은 content_text, 바이너리 파일은 content_base64를 사용합니다.
+
+    Args:
+        filename: 저장할 파일명 (예: 'data.csv', 'model.pt')
+        content_base64: base64 인코딩된 파일 내용 (바이너리 파일용)
+        content_text: 텍스트 파일 내용 (CSV, JSON, Python 등)
+        dest: 저장 디렉토리 (워크스페이스 상대 경로, 기본: 'raw')
+        overwrite: True이면 기존 파일 덮어쓰기
+    """
+    import base64
+
+    if not filename:
+        return {"error": "filename을 지정하세요."}
+    if not content_base64 and not content_text:
+        return {"error": "content_base64 또는 content_text 중 하나를 제공하세요."}
+
+    # 경로 해석
+    try:
+        dest_path = _resolve_workspace_path(dest)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    os.makedirs(dest_path, exist_ok=True)
+    file_path = os.path.join(dest_path, filename)
+
+    # 덮어쓰기 방지
+    if os.path.exists(file_path) and not overwrite:
+        existing_size = os.path.getsize(file_path)
+        return {
+            "error": f"'{filename}'이 이미 존재합니다 ({_human_size(existing_size)}). overwrite=True로 덮어쓰기 가능.",
+            "existing_path": file_path,
+        }
+
+    # 디스크 공간 확인
+    disk = await run_cmd(f"df --output=avail -B1 {shlex.quote(WORKSPACE_ROOT)} | tail -1")
+    if disk["exit_code"] == 0:
+        avail = int(disk["stdout"].strip())
+        if avail < 100 * 1024 * 1024:  # 100MB 미만이면 경고
+            return {"error": f"디스크 공간 부족. 가용: {_human_size(avail)}"}
+
+    try:
+        if content_base64:
+            # 바이너리 파일: base64 디코딩
+            data = base64.b64decode(content_base64)
+            with open(file_path, "wb") as f:
+                f.write(data)
+            file_size = len(data)
+        else:
+            # 텍스트 파일: 직접 쓰기
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content_text)
+            file_size = len(content_text.encode("utf-8"))
+
+        return {
+            "success": True,
+            "path": file_path,
+            "filename": filename,
+            "size": _human_size(file_size),
+            "size_bytes": file_size,
+            "dest": dest,
+            "message": f"'{filename}'이 {dest}/에 저장되었습니다.",
+        }
+    except Exception as e:
+        return {"error": f"파일 저장 실패: {str(e)}"}
+
+
+# ── Tool: URL 다운로드 ───────────────────────────────────────
+@mcp.tool()
+async def fetch_url(
+    url: str,
+    dest: str = "",
+    filename: str = "",
+    extract: bool = False,
+    timeout: int = 600,
+) -> dict:
+    """
+    Jetson Xavier에서 URL로부터 파일을 다운로드합니다.
+    Kaggle, HuggingFace, 공개 데이터셋 등에 활용합니다.
+
+    Args:
+        url: 다운로드할 URL
+        dest: 저장 디렉토리 (기본: data/raw/). 워크스페이스 상대 경로 가능.
+        filename: 저장 파일명 (기본: URL에서 추출)
+        extract: True이면 tar.gz/zip 자동 해제
+        timeout: 다운로드 타임아웃(초), 기본 600초
+    """
+    # URL 검증
+    if not url.startswith(("http://", "https://")):
+        return {"error": "http:// 또는 https:// URL만 지원합니다."}
+
+    # 대상 경로 결정
+    if dest:
+        try:
+            dest_path = _resolve_workspace_path(dest)
+        except ValueError as e:
+            return {"error": str(e)}
+    else:
+        dest_path = os.path.join(WORKSPACE_ROOT, "raw")
+
+    os.makedirs(dest_path, exist_ok=True)
+
+    # 파일명 결정
+    if not filename:
+        from urllib.parse import urlparse, unquote
+        parsed = urlparse(url)
+        filename = unquote(os.path.basename(parsed.path)) or "download"
+
+    file_path = os.path.join(dest_path, filename)
+
+    # wget으로 다운로드 (대용량 파일 메모리 효율)
+    import time
+    start_time = time.time()
+    cmd = f"wget -q --show-progress -O {shlex.quote(file_path)} {shlex.quote(url)}"
+    result = await run_cmd(cmd, timeout=min(timeout, 3600))
+
+    if result["exit_code"] != 0:
+        # wget 실패 시 curl 시도
+        cmd = f"curl -fSL -o {shlex.quote(file_path)} {shlex.quote(url)}"
+        result = await run_cmd(cmd, timeout=min(timeout, 3600))
+
+    if result["exit_code"] != 0:
+        return {"error": f"다운로드 실패: {result['stderr']}"}
+
+    elapsed = time.time() - start_time
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+
+    response = {
+        "success": True,
+        "path": file_path,
+        "size": _human_size(file_size),
+        "elapsed_seconds": round(elapsed, 1),
+    }
+
+    # 압축 해제
+    if extract and os.path.exists(file_path):
+        extract_dir = os.path.join(dest_path, os.path.splitext(filename)[0])
+        if filename.endswith((".tar.gz", ".tgz")):
+            ext_cmd = f"tar -xzf {shlex.quote(file_path)} -C {shlex.quote(dest_path)}"
+        elif filename.endswith(".tar.bz2"):
+            ext_cmd = f"tar -xjf {shlex.quote(file_path)} -C {shlex.quote(dest_path)}"
+        elif filename.endswith(".zip"):
+            ext_cmd = f"unzip -o {shlex.quote(file_path)} -d {shlex.quote(dest_path)}"
+        elif filename.endswith(".gz") and not filename.endswith(".tar.gz"):
+            ext_cmd = f"gunzip -f {shlex.quote(file_path)}"
+        else:
+            ext_cmd = None
+
+        if ext_cmd:
+            ext_result = await run_cmd(ext_cmd, timeout=300)
+            response["extracted"] = ext_result["exit_code"] == 0
+            if ext_result["exit_code"] != 0:
+                response["extract_error"] = ext_result["stderr"]
+
+    return response
+
+
+# ── Tool: 데이터 통계 ────────────────────────────────────────
+@mcp.tool()
+async def data_stats(path: str, sample_rows: int = 5) -> dict:
+    """
+    데이터 파일의 기본 통계를 반환합니다. CSV, Parquet, JSON 지원.
+
+    Args:
+        path: 데이터 파일 경로. 워크스페이스 상대 경로 가능 (예: "v1/sales.csv")
+        sample_rows: 미리보기 행 수 (기본 5행)
+    """
+    # 경로 해석: 절대 경로가 아니면 워크스페이스 상대 경로
+    if not os.path.isabs(path):
+        try:
+            path = _resolve_workspace_path(path)
+        except ValueError as e:
+            return {"error": str(e)}
+
+    if not os.path.exists(path):
+        return {"error": f"파일이 존재하지 않습니다: {path}"}
+
+    ext = os.path.splitext(path)[1].lower()
+    sample_rows = min(sample_rows, 20)
+
+    code = f"""
+import json, sys
+try:
+    import pandas as pd
+    path = {repr(path)}
+    ext = {repr(ext)}
+    sample = {sample_rows}
+
+    if ext == '.csv':
+        df = pd.read_csv(path, nrows=10000)
+    elif ext == '.tsv':
+        df = pd.read_csv(path, sep='\\t', nrows=10000)
+    elif ext in ('.parquet', '.pq'):
+        df = pd.read_parquet(path)
+    elif ext == '.json':
+        df = pd.read_json(path)
+    else:
+        print(json.dumps({{"error": "지원하지 않는 형식: " + ext}}))
+        sys.exit(0)
+
+    # 전체 행 수 (CSV는 파일 전체 카운트)
+    total_rows = len(df)
+    if ext == '.csv' and total_rows >= 10000:
+        import subprocess
+        wc = subprocess.run(['wc', '-l', path], capture_output=True, text=True)
+        if wc.returncode == 0:
+            total_rows = int(wc.stdout.split()[0]) - 1
+
+    result = {{
+        "shape": list(df.shape),
+        "total_rows": total_rows,
+        "columns": list(df.columns),
+        "dtypes": {{col: str(dtype) for col, dtype in df.dtypes.items()}},
+        "null_counts": df.isnull().sum().to_dict(),
+        "head": df.head(sample).to_dict(orient='records'),
+    }}
+
+    # 수치 컬럼 기본 통계
+    num_cols = df.select_dtypes(include=['number']).columns.tolist()
+    if num_cols:
+        desc = df[num_cols].describe().to_dict()
+        result["describe"] = desc
+
+    print(json.dumps(result, default=str, ensure_ascii=False))
+
+except ImportError:
+    print(json.dumps({{"error": "pandas가 설치되어 있지 않습니다."}}))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+"""
+    result = await run_python(code, timeout=60)
+    if result["exit_code"] != 0:
+        return {"error": f"분석 실패: {result['stderr'] or result['stdout']}"}
+
+    try:
+        return json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {"output": result["stdout"]}
+
+
+# ── Tool: DuckDB 쿼리 ────────────────────────────────────────
+@mcp.tool()
+async def db_query(sql: str, limit: int = 100) -> dict:
+    """
+    DuckDB에서 SQL 쿼리를 실행합니다. 시계열 분석, 집계, Parquet/CSV 직접 쿼리 지원.
+
+    Args:
+        sql: 실행할 SQL 쿼리. Parquet/CSV 직접 쿼리 가능:
+             SELECT * FROM read_csv_auto('data/raw/sales.csv')
+             SELECT * FROM 'data/v1/output.parquet'
+        limit: 최대 반환 행 수 (기본 100)
+    """
+    limit = min(limit, 10000)
+
+    code = f"""
+import json, sys, os
+try:
+    import duckdb
+    db_path = {repr(DUCKDB_PATH)}
+    ws_root = {repr(WORKSPACE_ROOT)}
+
+    # 워크스페이스 디렉토리를 기준으로 상대 경로 사용 가능하도록
+    os.chdir(ws_root)
+
+    con = duckdb.connect(db_path)
+    sql = {repr(sql)}
+    limit = {limit}
+
+    result = con.execute(sql).fetchdf()
+    total_rows = len(result)
+
+    if total_rows > limit:
+        result = result.head(limit)
+
+    output = {{
+        "columns": list(result.columns),
+        "total_rows": total_rows,
+        "returned_rows": len(result),
+        "data": result.to_dict(orient='records'),
+    }}
+    con.close()
+    print(json.dumps(output, default=str, ensure_ascii=False))
+
+except ImportError:
+    print(json.dumps({{"error": "duckdb가 설치되어 있지 않습니다. install_package('duckdb')로 설치하세요."}}))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+"""
+    result = await run_python(code, timeout=120)
+    if result["exit_code"] != 0:
+        return {"error": f"쿼리 실패: {result['stderr'] or result['stdout']}"}
+
+    try:
+        return json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {"output": result["stdout"]}
+
+
+# ── Tool: DuckDB 데이터 적재 ─────────────────────────────────
+@mcp.tool()
+async def db_ingest(
+    source: str,
+    table: str,
+    mode: str = "create",
+) -> dict:
+    """
+    CSV/Parquet 파일을 DuckDB 테이블로 적재합니다.
+
+    Args:
+        source: 데이터 파일 경로. 워크스페이스 상대 경로 가능 (예: "raw/sales.csv")
+        table: 생성할 테이블 이름
+        mode: 적재 모드
+            - "create": 새 테이블 생성 (이미 있으면 에러)
+            - "replace": 기존 테이블 교체
+            - "append": 기존 테이블에 추가
+    """
+    if not source or not table:
+        return {"error": "source와 table을 모두 지정하세요."}
+    if mode not in ("create", "replace", "append"):
+        return {"error": "mode는 create, replace, append 중 하나입니다."}
+
+    # 경로 해석
+    if not os.path.isabs(source):
+        try:
+            source = _resolve_workspace_path(source)
+        except ValueError as e:
+            return {"error": str(e)}
+
+    if not os.path.exists(source):
+        return {"error": f"파일이 존재하지 않습니다: {source}"}
+
+    ext = os.path.splitext(source)[1].lower()
+
+    code = f"""
+import json, sys, os
+try:
+    import duckdb
+    db_path = {repr(DUCKDB_PATH)}
+    source = {repr(source)}
+    table = {repr(table)}
+    mode = {repr(mode)}
+    ext = {repr(ext)}
+
+    con = duckdb.connect(db_path)
+
+    if ext == '.csv':
+        read_fn = f"read_csv_auto('{{source}}')"
+    elif ext in ('.parquet', '.pq'):
+        read_fn = f"read_parquet('{{source}}')"
+    elif ext == '.json':
+        read_fn = f"read_json_auto('{{source}}')"
+    else:
+        print(json.dumps({{"error": "지원하지 않는 형식: " + ext}}))
+        sys.exit(0)
+
+    if mode == "create":
+        con.execute(f"CREATE TABLE {{table}} AS SELECT * FROM {{read_fn}}")
+    elif mode == "replace":
+        con.execute(f"CREATE OR REPLACE TABLE {{table}} AS SELECT * FROM {{read_fn}}")
+    elif mode == "append":
+        con.execute(f"INSERT INTO {{table}} SELECT * FROM {{read_fn}}")
+
+    # 결과 확인
+    count = con.execute(f"SELECT COUNT(*) FROM {{table}}").fetchone()[0]
+    cols = [desc[0] for desc in con.execute(f"SELECT * FROM {{table}} LIMIT 0").description]
+    tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+
+    con.close()
+    print(json.dumps({{
+        "success": True,
+        "table": table,
+        "rows": count,
+        "columns": cols,
+        "mode": mode,
+        "all_tables": tables,
+    }}))
+
+except ImportError:
+    print(json.dumps({{"error": "duckdb가 설치되어 있지 않습니다. install_package('duckdb')로 설치하세요."}}))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+"""
+    result = await run_python(code, timeout=300)
+    if result["exit_code"] != 0:
+        return {"error": f"적재 실패: {result['stderr'] or result['stdout']}"}
+
+    try:
+        return json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {"output": result["stdout"]}
+
+
 # ── 메인 ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
@@ -782,4 +1637,7 @@ if __name__ == "__main__":
     mcp.settings.port = args.port
 
     print(f"🚀 Jetson Xavier MCP Server starting on {args.host}:{args.port}")
+    print(f"   Python: {platform.python_version()} | PID: {os.getpid()}")
+    print(f"   Jobs dir: {JOBS_DIR}")
+    print(f"   Workspace: {WORKSPACE_ROOT}")
     mcp.run(transport="streamable-http")
