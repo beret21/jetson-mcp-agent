@@ -1,4 +1,4 @@
-# Jetson Xavier MCP Server 설정 가이드
+# Jetson MCP Agent 설정 가이드
 
 ## ⚠️ Jetson Xavier 환경 제약사항 (반드시 준수)
 

@@ -1,6 +1,6 @@
-# Jetson Xavier MCP Server
+# Jetson MCP Agent
 
-NVIDIA Jetson Xavier의 CUDA/GPU 자원을 [Claude Code](https://claude.ai/code)에서 원격으로 활용할 수 있는 [MCP(Model Context Protocol)](https://modelcontextprotocol.io/) 서버입니다.
+NVIDIA Jetson Xavier의 CUDA/GPU 자원을 [Claude Code](https://claude.ai/code)에서 원격으로 활용하는 [MCP](https://modelcontextprotocol.io/) 서버 + 자율 EDA Agent입니다. 대화 모드(사용자 지시)와 자율 모드(Agent 위임)를 동시에 지원하는 하이브리드 아키텍처입니다.
 
 ## Architecture
 

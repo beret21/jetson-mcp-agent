@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Jetson Xavier MCP Server 배포 스크립트
+# Jetson MCP Agent 배포 스크립트
 #
 # ⚠️ 환경 제약:
 #   - MCP 서버: Python 3.10 venv (MCP SDK requires-python >=3.10)
@@ -31,7 +31,7 @@ if [ "$JETSON_HOST" = "YOUR_JETSON_IP" ] || [ "$JETSON_USER" = "YOUR_USERNAME" ]
     exit 1
 fi
 
-echo "📦 Jetson Xavier MCP Server 배포 시작"
+echo "📦 Jetson MCP Agent 배포 시작"
 echo "   Target: ${JETSON_USER}@${JETSON_HOST}:${JETSON_DIR}"
 echo "   Python: ${PYTHON310} (venv: ${VENV_DIR})"
 echo ""
@@ -75,7 +75,7 @@ ssh ${JETSON_USER}@${JETSON_HOST} "
 echo "4️⃣  systemd 서비스 등록 중..."
 ssh ${JETSON_USER}@${JETSON_HOST} "cat > /tmp/jetson-mcp.service << UNIT
 [Unit]
-Description=Jetson Xavier MCP Server
+Description=Jetson MCP Agent
 After=network.target
 
 [Service]
