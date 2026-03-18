@@ -4,30 +4,12 @@ NVIDIA Jetson Xavier의 CUDA/GPU 자원을 [Claude Code](https://claude.ai/code)
 
 ## Architecture
 
-```
-[대화 모드 — Mac에서 직접 지시]
-┌──────────────┐   Streamable HTTP   ┌──────────────────────────────┐
-│  Mac         │                     │  Jetson Xavier               │
-│  Claude Code │  ◄──── :8765 ────►  │  MCP Server (9 도구 그룹)     │
-│  (LLM 판단)  │                     │     │                        │
-└──────────────┘                     │     ├─ CUDA 11.4 / GPU       │
-                                     │     ├─ PyTorch (Python 3.8)  │
-                                     │     ├─ DuckDB (SQL 분석)     │
-                                     │     └─ XAI (설명가능AI)      │
-                                     └──────────────────────────────┘
+![Jetson MCP Server — 하이브리드 EDA 자동화 아키텍처](img/Fig2.jpg)
 
-[자율 모드 — Jetson이 독립적으로 EDA 수행]
-┌──────────────┐   agent(submit)     ┌──────────────────────────────┐
-│  Mac         │  ──────────────►    │  Jetson Xavier               │
-│  Claude Code │                     │  ┌─ Claude Code CLI ──────┐  │
-│  (작업 위임)  │  ◄── agent(result)  │  │  (자율 판단 + EDA 루프)  │  │
-└──────────────┘                     │  │     ↕ localhost:8765    │  │
-                                     │  │  MCP Server (9 도구)    │  │
-                                     │  └─────────────────────────┘  │
-                                     └──────────────────────────────┘
-```
+**하이브리드 설계** — 두 가지 운영 모드가 동일한 9개 MCP 도구 계층을 공유합니다:
 
-**하이브리드 설계**: 대화 모드(사용자 지시) + 자율 모드(Agent 위임) 동시 지원
+- **대화 모드 (Interactive)**: Mac Claude Code가 사용자 지시에 따라 Jetson MCP 도구를 원격 호출 (Streamable HTTP :8765)
+- **자율 모드 (Autonomous)**: `agent(submit)`으로 작업을 위임하면 Jetson의 Claude Code CLI가 독립적으로 EDA 루프를 수행하고 결과를 기록
 
 ## EDA Reasoning Loop
 
