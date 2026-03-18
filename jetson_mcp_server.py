@@ -5,7 +5,7 @@ Jetson Xavier MCP Server
 Mac의 Claude Code에서 Jetson Xavier의 CUDA 자원을 활용할 수 있도록
 MCP(Model Context Protocol) 서버를 제공합니다.
 
-8개 그룹 도구:
+9개 그룹 도구:
   system    — 시스템 상태 관찰
   execute   — 코드 실행 (shell, python, benchmark)
   file      — 파일 I/O
@@ -14,6 +14,7 @@ MCP(Model Context Protocol) 서버를 제공합니다.
   workspace — 데이터 버전 관리
   data      — 데이터 I/O + 정제
   xai       — XAI 설명·분석 계층
+  agent     — 자율 EDA Agent 작업 관리
 
 Transport: Streamable HTTP (원격 접속 지원)
 """
@@ -2137,6 +2138,196 @@ async def xai(action: str, path: str = "", job_id: str = "",
 
 
 # ══════════════════════════════════════════════════════════════
+#  9. agent — 자율 EDA Agent 작업 관리
+# ══════════════════════════════════════════════════════════════
+
+# Agent 모듈 임포트 (사용 가능 여부 확인)
+try:
+    from agent.task_store import submit_task, load_task, update_task, list_tasks
+    AGENT_AVAILABLE = True
+except ImportError:
+    AGENT_AVAILABLE = False
+
+
+@mcp.tool()
+async def agent(
+    action: str,
+    task: str = "",
+    task_id: str = "",
+    dataset: str = "",
+    max_iterations: int = 5,
+    compact: bool = False,
+) -> dict:
+    """자율 Agent 작업 관리 — Jetson이 독립적으로 EDA를 수행합니다.
+
+    Actions:
+        submit  — 새 EDA 작업 제출 (task + dataset 필요). 백그라운드 실행.
+        status  — 작업 상태/진행률 확인 (task_id 필요).
+        result  — 완료된 작업의 보고서 조회 (task_id 필요).
+        list    — 전체 작업 목록.
+        cancel  — 실행 중인 작업 취소 (task_id 필요).
+
+    Args:
+        action: submit | status | result | list | cancel
+        task: 작업 설명 (submit 시)
+        task_id: 작업 ID (status/result/cancel 시)
+        dataset: 데이터셋 경로 (submit 시, workspace 상대경로 가능)
+        max_iterations: 최대 EDA 반복 횟수 (기본 5)
+        compact: 압축 출력 (기본 false)
+    """
+    if not AGENT_AVAILABLE:
+        return {"error": "Agent 모듈을 사용할 수 없습니다. agent/ 디렉토리를 확인하세요."}
+
+    try:
+        if action == "submit":
+            if not task or not dataset:
+                return {"error": "submit에는 task와 dataset이 필요합니다."}
+
+            # 상대경로 → 절대경로
+            if not os.path.isabs(dataset):
+                dataset = os.path.join(WORKSPACE_ROOT, dataset)
+
+            if not os.path.exists(dataset):
+                return {"error": f"데이터셋을 찾을 수 없습니다: {dataset}"}
+
+            # 작업 제출
+            task_data = submit_task(
+                task=task,
+                dataset=dataset,
+                max_iterations=max_iterations,
+            )
+            tid = task_data["id"]
+
+            # 백그라운드에서 EDA 루프 실행
+            agent_runner = os.path.join(os.path.dirname(__file__), "agent", "agent_runner.py")
+            log_path = os.path.join(
+                os.path.dirname(__file__), "agent_tasks", f"{tid}.log"
+            )
+
+            cmd = [sys.executable, agent_runner, "run", "--task-id", tid]
+
+            with open(log_path, "w") as log_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    cwd=os.path.dirname(__file__),
+                )
+
+            update_task(tid, {"pid": proc.pid})
+
+            result = {
+                "task_id": tid,
+                "status": "submitted",
+                "task": task,
+                "dataset": dataset,
+                "max_iterations": max_iterations,
+                "pid": proc.pid,
+            }
+            if not compact:
+                result["message"] = f"EDA 작업이 제출되었습니다. agent(status, task_id=\"{tid}\")로 확인하세요."
+                result["log"] = log_path
+            return result
+
+        elif action == "status":
+            if not task_id:
+                return {"error": "status에는 task_id가 필요합니다."}
+            t = load_task(task_id)
+            if not t:
+                return {"error": f"작업을 찾을 수 없습니다: {task_id}"}
+
+            result = {
+                "task_id": t["id"],
+                "status": t["status"],
+                "task": t["task"],
+                "submitted_at": t.get("submitted_at", ""),
+            }
+
+            iterations = t.get("iterations", [])
+            if iterations:
+                result["iterations"] = len(iterations)
+                result["current_accuracy"] = iterations[-1].get("accuracy")
+                if not compact:
+                    result["iteration_details"] = [
+                        {
+                            "iteration": it["iteration"],
+                            "accuracy": it.get("accuracy"),
+                            "actions": it.get("actions", []),
+                        }
+                        for it in iterations
+                    ]
+
+            if t["status"] == "completed":
+                result["best_accuracy"] = t.get("best_accuracy")
+                result["finished_at"] = t.get("finished_at", "")
+            elif t["status"] == "failed":
+                result["error"] = t.get("error", "")[:300]
+
+            return result
+
+        elif action == "result":
+            if not task_id:
+                return {"error": "result에는 task_id가 필요합니다."}
+            t = load_task(task_id)
+            if not t:
+                return {"error": f"작업을 찾을 수 없습니다: {task_id}"}
+            if t["status"] != "completed":
+                return {"error": f"작업이 아직 완료되지 않았습니다. 현재 상태: {t['status']}"}
+
+            result = {
+                "task_id": t["id"],
+                "status": "completed",
+                "best_accuracy": t.get("best_accuracy"),
+                "total_iterations": t.get("total_iterations"),
+                "finished_at": t.get("finished_at", ""),
+            }
+
+            report = t.get("final_report", "")
+            if report:
+                result["report"] = report
+            else:
+                result["iterations"] = t.get("iterations", [])
+
+            return result
+
+        elif action == "list":
+            tasks = list_tasks()
+            if compact:
+                return {"tasks": [{"id": t["id"], "status": t["status"]} for t in tasks]}
+            return {"tasks": tasks, "total": len(tasks)}
+
+        elif action == "cancel":
+            if not task_id:
+                return {"error": "cancel에는 task_id가 필요합니다."}
+            t = load_task(task_id)
+            if not t:
+                return {"error": f"작업을 찾을 수 없습니다: {task_id}"}
+            if t["status"] not in ("queued", "running"):
+                return {"error": f"취소할 수 없는 상태입니다: {t['status']}"}
+
+            # PID로 프로세스 종료 시도
+            pid = t.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, 15)  # SIGTERM
+                except ProcessLookupError:
+                    pass  # 이미 종료됨
+
+            update_task(task_id, {
+                "status": "cancelled",
+                "finished_at": datetime.now().isoformat(),
+            })
+            return {"task_id": task_id, "status": "cancelled"}
+
+        else:
+            return {"error": f"Unknown action: {action}. Use: submit, status, result, list, cancel"}
+
+    except Exception as e:
+        return {"error": f"agent error: {traceback.format_exc()}"}
+
+
+# ══════════════════════════════════════════════════════════════
 #  메인
 # ══════════════════════════════════════════════════════════════
 
@@ -2153,6 +2344,6 @@ if __name__ == "__main__":
 
     print(f"🚀 Jetson Xavier MCP Server starting on {args.host}:{args.port}")
     print(f"   Python: {platform.python_version()} | PID: {os.getpid()}")
-    print(f"   Tools: 8 groups (system, execute, file, device, job, workspace, data, xai)")
+    print(f"   Tools: 9 groups (system, execute, file, device, job, workspace, data, xai, agent)")
     print(f"   Workspace: {WORKSPACE_ROOT}")
     mcp.run(transport="streamable-http")

@@ -5,18 +5,29 @@ NVIDIA Jetson Xavier의 CUDA/GPU 자원을 [Claude Code](https://claude.ai/code)
 ## Architecture
 
 ```
+[대화 모드 — Mac에서 직접 지시]
 ┌──────────────┐   Streamable HTTP   ┌──────────────────────────────┐
 │  Mac         │                     │  Jetson Xavier               │
-│  Claude Code │  ◄──── :8765 ────►  │  MCP Server (Python 3.10)    │
+│  Claude Code │  ◄──── :8765 ────►  │  MCP Server (9 도구 그룹)     │
 │  (LLM 판단)  │                     │     │                        │
 └──────────────┘                     │     ├─ CUDA 11.4 / GPU       │
                                      │     ├─ PyTorch (Python 3.8)  │
                                      │     ├─ DuckDB (SQL 분석)     │
                                      │     └─ XAI (설명가능AI)      │
                                      └──────────────────────────────┘
+
+[자율 모드 — Jetson이 독립적으로 EDA 수행]
+┌──────────────┐   agent(submit)     ┌──────────────────────────────┐
+│  Mac         │  ──────────────►    │  Jetson Xavier               │
+│  Claude Code │                     │  ┌─ Claude Code CLI ──────┐  │
+│  (작업 위임)  │  ◄── agent(result)  │  │  (자율 판단 + EDA 루프)  │  │
+└──────────────┘                     │  │     ↕ localhost:8765    │  │
+                                     │  │  MCP Server (9 도구)    │  │
+                                     │  └─────────────────────────┘  │
+                                     └──────────────────────────────┘
 ```
 
-**설계 원칙**: MCP 서버 = 도구 계층 (computation) / LLM = 판단 계층 (judgment)
+**하이브리드 설계**: 대화 모드(사용자 지시) + 자율 모드(Agent 위임) 동시 지원
 
 ## EDA Reasoning Loop
 
@@ -42,9 +53,10 @@ University of Michigan CNC Mill 데이터셋 (17,520 rows, 48 sensors)으로 실
 |------|------|--------|-----------|
 | **Iter 0** (Baseline) | 11개 (raw) | 46.32% | 원본 데이터 그대로 학습 |
 | `xai(diagnose)` | - | - | 다중공선성 14쌍, 미사용 30컬럼, 클래스 불균형 감지 |
-| **Iter 1** (Engineered) | 33개 | **84.87%** | 다중공선성 제거 + StandardScaler + class_weight |
+| **Iter 1** (Engineered) | 33개 | 84.87% | 다중공선성 제거 + StandardScaler + class_weight |
+| **Iter 2** (Autonomous Agent) | - | **92.04%** | experiment_id 제거 + 원핫인코딩 + BatchNorm+Dropout MLP |
 
-**+38.55%p 개선** — `xai(diagnose)` 추천만으로 달성.
+**+45.72%p 개선** — 자율 Agent가 data leakage 감지, 원핫인코딩, BatchNorm+Dropout 등을 자동으로 수행.
 
 ## Why Two Python Versions?
 
@@ -131,7 +143,7 @@ Just ask naturally:
 - *"CNC 센서 데이터 분석해줘"*
 - *"XAI로 모델 학습 결과 진단해줘"*
 
-## Available Tools (8 Groups)
+## Available Tools (9 Groups)
 
 모든 도구에 `compact: bool` 파라미터 지원 (토큰 50-70% 절감).
 
@@ -200,6 +212,26 @@ Just ask naturally:
 | `diagnose` | **학습 결과 + 데이터 특성 종합 진단** (피처 엔지니어링 추천) |
 | `compare` | **반복 학습 비교** (정확도 추이, 중단 판단) |
 
+### 9. `agent` — 자율 EDA Agent
+| Action | Description |
+|--------|-------------|
+| `submit` | 새 EDA 작업 제출 (백그라운드 실행) |
+| `status` | 작업 상태/진행률 확인 |
+| `result` | 완료된 작업의 보고서 조회 |
+| `list` | 전체 작업 목록 |
+| `cancel` | 실행 중인 작업 취소 |
+
+**자율 모드 사용법**:
+```
+"CNC 데이터 EDA를 Jetson에 위임해줘"
+→ agent(submit, task="CNC EDA", dataset="raw/cnc_mill_real.csv")
+→ 외출
+→ agent(result, task_id="agent_xxx") 로 결과 확인
+```
+
+Jetson의 Claude Code CLI가 MCP 도구를 자율적으로 호출하며 반복 EDA를 수행합니다.
+중단 기준: 정확도 ≥95%, 2회 연속 <1%p 개선, 최대 5회 반복.
+
 ## Fan Cooling Control
 
 | Profile | Description | Use Case |
@@ -234,13 +266,13 @@ sudo systemctl restart jetson-mcp   # Restart
 
 ## Roadmap
 
-- [x] 8개 그룹 도구 리팩토링 (23개 → 8개)
+- [x] 9개 그룹 도구 (system, execute, file, device, job, workspace, data, xai, agent)
 - [x] XAI 설명가능AI 계층
 - [x] EDA 반복 루프 (diagnose → engineer → compare)
 - [x] DuckDB SQL 분석 엔진
 - [x] 비동기 작업 큐 + 자동 팬 제어
 - [x] compact 모드 (토큰 50-70% 절감)
-- [ ] Claude Agent SDK 하이브리드 아키텍처
+- [x] 자율 Agent — Claude Code CLI 하이브리드 아키텍처
 - [ ] Model inference endpoints (ONNX, TensorRT)
 - [ ] ESP32 IoT 데이터 파이프라인
 
